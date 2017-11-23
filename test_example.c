@@ -5,31 +5,30 @@
 /* ローカル変数もスコープに入るので、翻訳単位でのテストが可能 */
 #include "example.c"
 
-int testExample_Initialize(void *obj)
+static int testExample_Initialize(void *obj)
 {
   /* テストスイート共通の初期化処理 */
   TEST_UNUSED_PARAMETER(obj);
   return 0;
 }
 
-int testExample_Finalize(void *obj)
+static int testExample_Finalize(void *obj)
 {
   /* テストスイート共通の終了処理 */
   TEST_UNUSED_PARAMETER(obj);
   return 0;
 }
 
-int testExample_CallApiTest(void *obj)
+static void testExample_CallApiTest(void *obj)
 {
   TEST_UNUSED_PARAMETER(obj);
 
-  if (my_exp(0) != exp(0)) {
-    /* テスト失敗 */
-    return 1;
-  } else {
-    /* テスト成功 */
-    return 0;
-  }
+  /* my_exp(0)とexp(0)が等しいかテスト */
+  Test_AssertCondition(my_exp(0) == exp(0));
+  Test_AssertEqual(my_exp(0), exp(0));
+
+  /* my_exp(0)とexp(1)が等しくないかテスト */
+  Test_AssertNotEqual(my_exp(0), exp(1));
 
 }
 

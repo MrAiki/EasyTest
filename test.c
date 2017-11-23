@@ -1,5 +1,6 @@
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 #include "test.h"
 
@@ -7,8 +8,8 @@
 #define Test_LogOutput(...) \
   fprintf(stdout, __VA_ARGS__)
 
-/* テストスイートの実行 */
-static int test_RunTestSuite(struct TestSuite *test_suite);
+/* 式文字列の最大長 */
+#define TEST_MAX_LEN_EXPRESSION_STRING (100)
 
 /* テスト関数リスト */
 struct TestFuncList {
@@ -24,21 +25,66 @@ struct TestSuite {
   TestInitFinFunctionType init_func;   /* 初期化関数 */
   TestInitFinFunctionType fin_func;    /* 終了関数   */
   struct TestFuncList*    tests;       /* テスト関数リスト */
+  uint32_t                num_asserts;  /* アサート数 */
+  uint32_t                num_failure; /* 失敗数 */
 };
 
 /* テストスイートのリスト */
 struct TestSuiteList {
   struct TestSuiteList *next;
-  struct TestSuite     suite;
+  struct TestSuite     suite;         /* note: テストスイートは公開するためリストのメンバとする */
 };
 
-/* テストスイートリストの実体 */
-static struct TestSuiteList *st_test_suite_list;
+/* テスト失敗ケース */
+typedef enum TestFailureTypeTag {
+  TEST_FAILURE_TYPE_CONDITION,        /* 条件式                                   */
+  TEST_FAILURE_TYPE_EQAL_EXPECT,      /* 期待した値                               */
+  TEST_FAILURE_TYPE_NOT_EQAL_EXPECT,  /* 期待しない値                             */
+  TEST_FAILURE_TYPE_FLOAT32_EXPECT,   /* （未実装）32bit浮動小数のイプシロン以下  */
+} TestFailureType;
+
+/* テスト失敗情報 */
+struct TestFailureList {
+  struct TestFailureList*    next;
+  TestFailureType            type;                                          /* 失敗ケース       */
+  const char*                file_name;                                     /* ファイル名       */
+  const char*                function_name;                                 /* テスト関数名     */
+  uint32_t                   line_no;                                       /* 失敗ケース行     */
+  const char*                expression;                                    /* 条件式文字列     */
+  int64_t                    expected_value;                                /* 期待した値       */
+  int64_t                    actual_value;                                  /* 実際の値         */
+  char                       expected_exp[TEST_MAX_LEN_EXPRESSION_STRING];  /* 期待した値文字列 */
+  char                       actual_exp[TEST_MAX_LEN_EXPRESSION_STRING];    /* 実際の値文字列   */
+  const struct TestSuite*    suite; /* 失敗したスイート */
+};
+
+/* テストランナー */
+struct TestRunner {
+  struct TestSuite       *current_suite; /* 現在テスト中のスイート */
+  struct TestSuiteList   *suite_list;    /* 全テストスイートリスト */
+  struct TestFailureList *failure_list;  /* 失敗リスト */
+};
+
+/* テストスイートの実行 */
+static int test_RunTestSuite(struct TestSuite *test_suite);
+/* 失敗ケースの追加 */
+static int test_AddNewFailure(struct TestRunner *runner, 
+    struct TestFailureList *new_failure);
+/* 期待する数値アサート・サブルーチン */
+static void test_AssertEqualSub(
+    TestFailureType type, int64_t expect, int64_t actual,
+    const char* file_name, const char* function_name, 
+    uint32_t    line_no, const char* expected_exp,
+    const char* actual_exp);
+
+/* テストランナーの実体 */
+static struct TestRunner st_test_runner;
 
 /* テストの初期化 */
 void Test_Initialize(void)
 {
-  st_test_suite_list = NULL;
+  st_test_runner.suite_list   = NULL;
+  st_test_runner.failure_list = NULL;
 }
 
 /* テストの終了 */
@@ -46,9 +92,10 @@ void Test_Finalize(void)
 {
   struct TestSuiteList *suite, *tmp_suite;
   struct TestFuncList *test, *tmp_test;
+  struct TestFailureList *fail, *tmp_fail;
 
   /* 全スイートとテストを解放 */
-  for (suite = st_test_suite_list;
+  for (suite = st_test_runner.suite_list;
        suite != NULL; ) {
     for (test = suite->suite.tests;
          test != NULL; ) {
@@ -64,6 +111,18 @@ void Test_Finalize(void)
     free(suite);
     suite = tmp_suite;
   }
+
+  /* 失敗リストを解放 */
+  for (fail = st_test_runner.failure_list;
+       fail != NULL; ) {
+      /* 失敗が一つもない（素晴らしい） */
+      if (fail == NULL) {
+        break;
+      }
+      tmp_fail = fail->next;
+      free(fail);
+      fail = tmp_fail;
+  }
 }
 
 struct TestSuite* 
@@ -78,19 +137,21 @@ Test_AddTestSuite(const char *suite_name,
   /* 新しいスイートの作成 */
   new_entry 
     = (struct TestSuiteList *)malloc(sizeof(struct TestSuiteList));
-  new_entry->next            = NULL;
-  new_entry->suite.suite_name = suite_name;
-  new_entry->suite.obj       = obj;
-  new_entry->suite.init_func = init_func;
-  new_entry->suite.fin_func  = fin_func;
-  new_entry->suite.tests     = NULL;
+  new_entry->next               = NULL;
+  new_entry->suite.suite_name   = suite_name;
+  new_entry->suite.obj          = obj;
+  new_entry->suite.init_func    = init_func;
+  new_entry->suite.fin_func     = fin_func;
+  new_entry->suite.tests        = NULL;
+  new_entry->suite.num_asserts  = 0;
+  new_entry->suite.num_failure  = 0;
 
-  if (st_test_suite_list == NULL) {
+  if (st_test_runner.suite_list == NULL) {
     /* 初回のみ先頭に追加 */
-    st_test_suite_list = new_entry;
+    st_test_runner.suite_list = new_entry;
   } else {
     /* 末尾に至るまでリストを辿る */
-    for (list_pos        = st_test_suite_list;
+    for (list_pos        = st_test_runner.suite_list;
          list_pos->next != NULL;
          list_pos        = list_pos->next) ;
 
@@ -133,15 +194,63 @@ void Test_AddTestWithName(
 
 }
 
+/* 全失敗情報の印字 */
+int Test_PrintAllFailures(void)
+{
+  struct TestFailureList* fail;
+
+  Test_LogOutput("====== %-30s ======\n", "Failures");
+
+  /* 失敗が一つもない */
+  if (st_test_runner.failure_list == NULL) {
+    Test_LogOutput("There are no failures. \n");
+    return 0;
+  }
+
+  for (fail = st_test_runner.failure_list;
+       fail != NULL;
+       fail = fail->next) {
+    Test_LogOutput("File:%s(line:%d) In function %s \n",
+        fail->file_name, fail->line_no, fail->function_name);
+    switch (fail->type) {
+      case TEST_FAILURE_TYPE_CONDITION:
+        Test_LogOutput("Expression %s evaluated as FALSE. \n",
+            fail->expression);
+        break;
+      case TEST_FAILURE_TYPE_EQAL_EXPECT:
+        Test_LogOutput("Expression %s(=%lld) is not equal to %s(=%lld). \n",
+            fail->expected_exp, fail->expected_value,
+            fail->actual_exp, fail->actual_value);
+        break;
+      case TEST_FAILURE_TYPE_NOT_EQAL_EXPECT:
+        Test_LogOutput("Expression %s(=%lld) is equal to %s(=%lld). \n",
+            fail->expected_exp, fail->expected_value,
+            fail->actual_exp, fail->actual_value);
+        break;
+      default:
+        Test_LogOutput("Not Supported Fail Type. \n");
+        break;
+    }
+  }
+
+  return 0;
+
+}
+
 /* 全テストスイートの実行 */
 int Test_RunAllTestSuite(void)
 {
   int ret = 0, tmp_ret;
   struct TestSuiteList *suite;
 
-  for (suite  = st_test_suite_list;
+  for (suite  = st_test_runner.suite_list;
        suite != NULL;
        suite  = suite->next) {
+
+    /* 現在実行中のスイートに変更
+     * マルチスレッド動作時は test_RunTestSuite も含め
+     * 排他する必要がある */
+    st_test_runner.current_suite = &suite->suite;
 
     /* 異常終了の回数だけインクリメント */
     tmp_ret = test_RunTestSuite(&suite->suite); 
@@ -151,7 +260,7 @@ int Test_RunAllTestSuite(void)
 
   }
 
-  Test_LogOutput("[Failures:%d] Test Done. \n", ret);
+  Test_LogOutput("%-30s Done. [Total Failures:%d]\n", "Test", ret);
 
   return ret;
 }
@@ -159,12 +268,10 @@ int Test_RunAllTestSuite(void)
 /* 一つのテストスイートを実行するサブルーチン */
 static int test_RunTestSuite(struct TestSuite *test_suite)
 {
-  int ret, tmp_ret;
   struct TestFuncList* func_list;
 
   Test_LogOutput("====== %-30s ======\n", test_suite->suite_name);
 
-  ret = 0;
   for (func_list = test_suite->tests;
        func_list != NULL;
        func_list = func_list->next) {
@@ -172,19 +279,140 @@ static int test_RunTestSuite(struct TestSuite *test_suite)
     /* 初期化関数実行 */
     test_suite->init_func(test_suite->obj);
     /* テスト実行 */
-    tmp_ret = func_list->test_func(test_suite->obj);
-    if (tmp_ret != 0) { ret++; }
+    func_list->test_func(test_suite->obj);
     /* 終了関数実行 */
     test_suite->fin_func(test_suite->obj);
 
     /* 結果表示 */
-    Test_LogOutput("[%7s] Test %-30s\n",
-        (tmp_ret == 0) ? "SUCCESS" : "FAILED",
-        func_list->test_name);
+    Test_LogOutput("Done Test %-30s\n", func_list->test_name);
 
   }
 
-  Test_LogOutput("[Failures:%d] %-30s Done. \n", ret, test_suite->suite_name);
+  Test_LogOutput("%-30s Done. [Asserts:%d/Failures:%d] \n", test_suite->suite_name, test_suite->num_asserts, test_suite->num_failure);
 
-  return ret;
+  return test_suite->num_failure;
+}
+
+static int test_AddNewFailure(
+    struct TestRunner *runner,
+    struct TestFailureList *new_failure)
+{
+  struct TestFailureList* fail_pos;
+
+  /* 引数チェック */
+  if (runner == NULL || new_failure == NULL) {
+    return -1;
+  }
+
+  /* スイートの失敗回数を増加 */
+  runner->current_suite->num_failure++;
+
+  /* どのスイートで失敗したのか */
+  new_failure->suite = runner->current_suite;
+
+  /* リストに追加 */
+  if (runner->failure_list == NULL) {
+    /* 初回のみ先頭に追加 */
+    runner->failure_list = new_failure;
+  } else {
+    for (fail_pos        = runner->failure_list;
+         fail_pos->next != NULL;
+         fail_pos        = fail_pos->next) ;
+    fail_pos->next = new_failure;
+  }
+
+  return 0;
+}
+
+/* 条件式アサート */
+void Test_AssertConditionFunc(int32_t condition, 
+    const char* file_name, 
+    const char* function_name, 
+    uint32_t    line_no,
+    const char* cond_expression)
+{
+  struct TestFailureList* fail;
+
+  /* アサート回数をインクリメント */
+  st_test_runner.current_suite->num_asserts++;
+
+  /* 成功していれば即時リターン */
+  if (condition != 0) {
+    return;
+  }
+
+  /* 失敗情報を生成 */
+  fail = (struct TestFailureList *)malloc(sizeof(struct TestFailureList));
+  fail->next          = NULL;
+  fail->type          = TEST_FAILURE_TYPE_CONDITION;
+  fail->file_name     = file_name;
+  fail->function_name = function_name;
+  fail->line_no       = line_no;
+  fail->expression    = cond_expression;
+  test_AddNewFailure(&st_test_runner, fail);
+}
+
+/* 期待する数値アサート・サブルーチン */
+static void test_AssertEqualSub(
+    TestFailureType type,
+    int64_t expect, int64_t actual,
+    const char* file_name, 
+    const char* function_name, 
+    uint32_t    line_no,
+    const char* expected_exp,
+    const char* actual_exp)
+{
+  struct TestFailureList* fail;
+
+  /* アサート回数をインクリメント */
+  st_test_runner.current_suite->num_asserts++;
+
+  /* 成功していれば即時リターン */
+  if (((type == TEST_FAILURE_TYPE_EQAL_EXPECT) && (expect == actual))
+      || ((type == TEST_FAILURE_TYPE_NOT_EQAL_EXPECT) && (expect != actual))) {
+    return;
+  }
+
+  /* 失敗情報を生成 */
+  fail = (struct TestFailureList *)malloc(sizeof(struct TestFailureList));
+  fail->next            = NULL;
+  fail->type            = type;
+  fail->file_name       = file_name;
+  fail->function_name   = function_name;
+  fail->line_no         = line_no;
+  fail->expected_value  = expect;
+  fail->actual_value    = actual;
+  strncpy(fail->expected_exp, expected_exp, TEST_MAX_LEN_EXPRESSION_STRING);
+  strncpy(fail->actual_exp, actual_exp, TEST_MAX_LEN_EXPRESSION_STRING);
+  test_AddNewFailure(&st_test_runner, fail);
+}
+
+void Test_AssertEqualFunc(
+    int64_t expect, int64_t actual,
+    const char* file_name, 
+    const char* function_name, 
+    uint32_t    line_no,
+    const char* expected_exp,
+    const char* actual_exp)
+{
+  test_AssertEqualSub(
+      TEST_FAILURE_TYPE_EQAL_EXPECT,
+      expect, actual,
+      file_name, function_name, line_no,
+      expected_exp, actual_exp);
+}
+
+void Test_AssertNotEqualFunc(
+    int64_t not_expect, int64_t actual,
+    const char* file_name, 
+    const char* function_name, 
+    uint32_t    line_no,
+    const char* expected_exp,
+    const char* actual_exp)
+{
+  test_AssertEqualSub(
+      TEST_FAILURE_TYPE_NOT_EQAL_EXPECT,
+      not_expect, actual,
+      file_name, function_name, line_no,
+      expected_exp, actual_exp);
 }
